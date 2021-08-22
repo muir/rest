@@ -5,22 +5,25 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 
 	"github.com/pkg/errors"
 )
 
-type RequestorFuncArg func(*requestOpts)
+type RequestorFuncArg func(*RequestOpts)
 
 type RequestOpts struct {
 	// Log          xm.Logger
-	Request      *http.Request // XXX
+	URL          string
+	BaseURL      string
 	HasData      bool
 	Data         interface{}
 	HasRaw       bool
-	Raw          []bytes
+	Raw          []byte
 	PathParams   map[string]string
 	QueryParams  url.Values
 	Encoder      func(interface{}) ([]byte, error)
@@ -41,7 +44,23 @@ type RequestOpts struct {
 }
 
 func (o RequestOpts) Copy() *RequestOpts {
-	// XXX
+	n := o
+	n.PathParams = make(map[string]string)
+	for k, v := range o.PathParams {
+		n.PathParams[k] = v
+	}
+	n.DecodeStatus = make(map[int]interface{})
+	for k, v := range o.DecodeStatus {
+		n.DecodeStatus[k] = v
+	}
+	c := *o.Client
+	n.Client = &c
+	n.Cookies = make([]*http.Cookie, 0, len(o.Cookies))
+	for i, cookie := range o.Cookies {
+		cc := *cookie
+		n.Cookies[i] = &cc
+	}
+	return &n
 }
 
 func Make() *RequestOpts {
@@ -78,7 +97,7 @@ func (o *RequestOpts) DecodeWith(f func([]byte, interface{}) error) *RequestOpts
 }
 
 func (o *RequestOpts) DecodeWithReader(f func(io.Reader, interface{}) error) *RequestOpts {
-	o.DecoderReader = f
+	o.DecodeReader = f
 	return o
 }
 
@@ -87,42 +106,57 @@ func (o *RequestOpts) EncodeWith(f func(interface{}) ([]byte, error)) *RequestOp
 	return o
 }
 
-func (o *RequestOpts) Client(client *http.Client) *RequestOpts {
+func (o *RequestOpts) WithClient(client *http.Client) *RequestOpts {
 	o.Client = client
 	return o
 }
 
 func (o *RequestOpts) Get(url string) error {
+	o.URL = url
 	o.Method = http.MethodGet
-	return o.DoAndDecode()
+	return o.Do().GetError()
 }
 
 func (o *RequestOpts) Post(url string) error {
+	o.URL = url
 	o.Method = http.MethodPost
-	return o.DoAndDecode()
+	return o.Do().GetError()
 }
 
-func (o *RequestOpts) Post(url string) error {
-	o.Method = http.MethodPost
-	return o.DoAndDecode()
+func (o *RequestOpts) Put(url string) error {
+	o.URL = url
+	o.Method = http.MethodPut
+	return o.Do().GetError()
 }
 
 func (o *RequestOpts) Head(url string) error {
+	o.URL = url
 	o.Method = http.MethodHead
-	return o.DoAndDecode()
+	return o.Do().GetError()
 }
 
 func (o *RequestOpts) Delete(url string) error {
+	o.URL = url
 	o.Method = http.MethodDelete
-	return o.DoAndDecode()
+	return o.Do().GetError()
 }
 
-func (o *RequestOpts) Method(m string) *RequestOpts {
+func (o *RequestOpts) WithURL(url string) *RequestOpts {
+	o.URL = url
+	return o
+}
+
+func (o *RequestOpts) WithBaseURL(url string) *RequestOpts {
+	o.BaseURL = url
+	return o
+}
+
+func (o *RequestOpts) WithMethod(m string) *RequestOpts {
 	o.Method = m
 	return o
 }
 
-func (o *RequestOpts) Data(data interface{}) *RequestOpts {
+func (o *RequestOpts) WithData(data interface{}) *RequestOpts {
 	o.HasData = true
 	o.Data = data
 	return o
@@ -134,7 +168,7 @@ func (o *RequestOpts) BodyIO(reader io.Reader) *RequestOpts {
 	return o
 }
 
-func (o *RequestOpts) Context(ctx context.Context) *RequestOpts {
+func (o *RequestOpts) WithContext(ctx context.Context) *RequestOpts {
 	o.Context = ctx
 	return o
 }
@@ -149,7 +183,7 @@ func (o *RequestOpts) PathParam(name string, value interface{}) *RequestOpts {
 	return o
 }
 
-func (o *RequestOpts) Raw(raw []byte) *RequestOpts {
+func (o *RequestOpts) WithRaw(raw []byte) *RequestOpts {
 	o.HasRaw = true
 	o.Raw = raw
 	return o
@@ -159,6 +193,8 @@ func (o *RequestOpts) Decode(statusCode int, target interface{}) *RequestOpts {
 	o.DecodeStatus[statusCode] = target
 	return o
 }
+
+var paramsRe = regexp.MustCompile(`\{(\w+)\}`)
 
 func (o *RequestOpts) Do() (result Result) {
 	result.Options = o
@@ -206,7 +242,7 @@ func (o *RequestOpts) Do() (result Result) {
 			return
 		}
 	default:
-		result.Error = Errorf("Unknown method '%s'", o.Method)
+		result.Error = errors.Errorf("Unknown method '%s'", o.Method)
 		return
 	}
 
@@ -222,22 +258,26 @@ func (o *RequestOpts) Do() (result Result) {
 		var err error
 		o.Raw, err = o.Encoder(o.Data)
 		if err != nil {
-			return nil, errors.Wrap(err, "encode request")
+			result.Error = errors.Wrap(err, "encode request")
+			return
 		}
 	}
 	var reader io.Reader
 	if o.HasReader {
-		reader = o.HasReader
+		reader = o.Reader
 	} else if hasBody {
 		reader = bytes.NewReader(o.Raw)
 	}
 
-	url := o.URL
+	u := o.URL
 	if o.BaseURL != "" {
-		url = o.BaseURL + "/" + url
+		u = o.BaseURL + "/" + u
 	}
 	var subMissing string
-	paramsRe.ReplaceAllStringFunc(url, func(key string) string {
+	paramsRe.ReplaceAllStringFunc(u, func(key string) string {
+		// remote bracketing { } since go regexp doesn't
+		// have look-ahead or look-behind
+		key = key[1 : len(key)-1]
 		if value, ok := o.PathParams[key]; ok {
 			return url.PathEscape(value)
 		}
@@ -249,13 +289,13 @@ func (o *RequestOpts) Do() (result Result) {
 		return
 	}
 	if len(o.QueryParams) != 0 {
-		url += "?" + o.QueryParams.Encode()
+		u += "?" + o.QueryParams.Encode()
 	}
 
 	if o.Context != nil {
 		o.Context = context.Background()
 	}
-	request, err := http.NewRequestWithContext(o.Context, o.Method, url, reader)
+	request, err := http.NewRequestWithContext(o.Context, o.Method, u, reader)
 	if err != nil {
 		result.Error = errors.Wrap(err, "create request")
 		return
@@ -288,8 +328,8 @@ func (o *RequestOpts) Do() (result Result) {
 	if o.AlwaysRead && result.Response.Body != nil {
 		result = result.ReadBody()
 	}
-	if target, ok := o.DecodeStatus[response.StatusCode]; ok {
-		result = result.Decode(response.StatusCode, target)
+	if target, ok := o.DecodeStatus[result.Response.StatusCode]; ok {
+		result = result.Decode(result.Response.StatusCode, target)
 		if o.After != nil {
 			result = result.HandleAfter()
 		}
@@ -309,7 +349,7 @@ type Result struct {
 }
 
 func (r Result) HandleAfter() Result {
-	if r.Options.After == nil || r.AfterDone {
+	if r.Options.After == nil || r.afterDone {
 		return r
 	}
 	r.afterDone = true
@@ -328,24 +368,24 @@ func (r Result) Decode(statusCode int, target interface{}) Result {
 		return r
 	}
 	var err error
-	if r.DecodeReader != nil {
+	if r.Options.DecodeReader != nil {
 		r.Decoded = true
 		body := r.Response.Body
 		if r.Read {
-			body = bytes.NewReader(r.Body)
+			body = io.NopCloser(bytes.NewReader(r.Body))
 		}
-		err = r.DecodeReader(body, target)
+		err = r.Options.DecodeReader(body, target)
 	} else {
 		r = r.ReadBody()
 		if r.Error != nil {
 			return r
 		}
-		if r.Decoder == nil {
+		if r.Options.Decoder == nil {
 			r.Error = errors.New("Cannot decode response because no decoder has been registererd")
 			return r
 		}
 		r.Decoded = true
-		err = r.Decoder(r.Body, target)
+		err = r.Options.Decoder(r.Body, target)
 	}
 	if err != nil {
 		r.Error = errors.Wrap(err, "decode body")
@@ -364,6 +404,7 @@ func (r Result) WillDecode() Result {
 		r.Error = errors.Errorf("No body with method %s", r.Options.Method)
 		return r
 	}
+	return r
 }
 
 func (r Result) ReadBody() Result {
@@ -388,7 +429,7 @@ func (r Result) Done() Result {
 	return r
 }
 
-func (r Result) Error() error {
+func (r Result) GetError() error {
 	r = r.HandleAfter()
 	return r.Error
 }
@@ -409,10 +450,10 @@ func (o *RequestOpts) JSON() *RequestOpts {
 		EncodeWith(json.Marshal)
 }
 
-func (o *ReuqestOpts) StrictJSON() *RequestOpts {
+func (o *RequestOpts) StrictJSON() *RequestOpts {
 	return o.
 		DecodeWithReader(func(r io.Reader, t interface{}) error {
-			decoder := json.NewDecoder()
+			decoder := json.NewDecoder(r)
 			decoder.DisallowUnknownFields()
 			return decoder.Decode(t)
 		}).
