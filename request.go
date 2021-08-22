@@ -300,6 +300,7 @@ func (o *RequestOpts) Do() (result Result) {
 		result.Error = errors.Wrap(err, "create request")
 		return
 	}
+	result.Request = request
 
 	for _, cookie := range o.Cookies {
 		request.AddCookie(cookie)
@@ -338,6 +339,7 @@ func (o *RequestOpts) Do() (result Result) {
 }
 
 type Result struct {
+	Request      *http.Request
 	Response     *http.Response
 	Error        error
 	Decoded      bool
